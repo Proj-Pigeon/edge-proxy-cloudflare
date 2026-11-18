@@ -1,0 +1,221 @@
+import { describe, it, beforeEach, afterEach } from 'node:test';
+import assert from 'node:assert/strict';
+import { brotliDecompressSync, gunzipSync } from 'node:zlib';
+import { osm } from '../src/routes/tiles.js';
+import { esri } from '../src/routes/tiles.js';
+import { openTopo } from '../src/routes/tiles.js';
+import { viirs } from '../src/routes/tiles.js';
+import { metadata as arcgisMeta, tile as arcgisTile } from '../src/routes/arcgis.js';
+import { earthquakes } from '../src/routes/earthquakes.js';
+import { modelsdev } from '../src/routes/modelsdev.js';
+import { health } from '../src/routes/health.js';
+import { manifest } from '../src/routes/manifest.js';
+
+describe('Route upstream URL construction & validation', () => {
+  const originalFetch = globalThis.fetch;
+  let calls = [];
+
+  beforeEach(() => {
+    calls = [];
+    globalThis.fetch = async (url, init) => {
+      calls.push({ url, init });
+      return new Response('mock-body', {
+        status: 200,
+        headers: {
+          'Content-Type': 'image/png',
+          'Content-Length': '9',
+          ETag: '"abc123"',
+        },
+      });
+    };
+  });
+
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  it('constructs OSM tile URL and strips .png from y parameter', async () => {
+    const res = await osm.onRequestGet({
+      request: new Request('https://mirror.example.com/tiles/osm/5/16/11.png'),
+      params: { z: '5', x: '16', y: '11.png' },
+    });
+    assert.equal(res.status, 200);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].url, 'https://tile.openstreetmap.org/5/16/11.png');
+    assert.equal(res.headers.get('X-Proxy-Upstream'), 'https://tile.openstreetmap.org/5/16/11.png');
+    assert.equal(res.headers.get('Cache-Control'), 'public, s-maxage=2592000, max-age=604800');
+  });
+
+  it('rejects OSM zoom > 19 with 400 without calling upstream', async () => {
+    const res = await osm.onRequestGet({
+      request: new Request('https://mirror.example.com/tiles/osm/20/0/0.png'),
+      params: { z: '20', x: '0', y: '0.png' },
+    });
+    assert.equal(res.status, 400);
+    assert.equal(res.headers.get('Cache-Control'), 'no-store');
+    assert.equal(calls.length, 0);
+  });
+
+  it('constructs Esri World Imagery URL in z/y/x order up to z=23', async () => {
+    const res = await esri.onRequestGet({
+      request: new Request('https://mirror.example.com/tiles/esri/21/500/1000'),
+      params: { z: '21', y: '500', x: '1000' },
+    });
+    assert.equal(res.status, 200);
+    assert.equal(
+      calls[0].url,
+      'https://services.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/21/500/1000'
+    );
+  });
+
+  it('rotates OpenTopoMap subdomain a/b/c by x % 3 and enforces z <= 17', async () => {
+    for (const [x, sub] of [
+      ['0', 'a'],
+      ['1', 'b'],
+      ['2', 'c'],
+      ['5', 'c'],
+    ]) {
+      calls = [];
+      const res = await openTopo.onRequestGet({
+        request: new Request(`https://mirror.example.com/tiles/opentopo/4/${x}/3.png`),
+        params: { z: '4', x, y: '3.png' },
+      });
+      assert.equal(res.status, 200);
+      assert.equal(calls[0].url, `https://${sub}.tile.opentopomap.org/4/${x}/3.png`);
+    }
+
+    calls = [];
+    const badZoom = await openTopo.onRequestGet({
+      request: new Request('https://mirror.example.com/tiles/opentopo/18/0/0.png'),
+      params: { z: '18', x: '0', y: '0.png' },
+    });
+    assert.equal(badZoom.status, 400);
+    assert.equal(calls.length, 0);
+  });
+
+  it('constructs NASA VIIRS URL with date and z/y/x.jpeg (z <= 8)', async () => {
+    const res = await viirs.onRequestGet({
+      request: new Request('https://mirror.example.com/tiles/viirs/2026-11-15/6/20/35.jpeg'),
+      params: { date: '2026-11-15', z: '6', y: '20', x: '35.jpeg' },
+    });
+    assert.equal(res.status, 200);
+    assert.equal(
+      calls[0].url,
+      'https://gibs.earthdata.nasa.gov/wmts/epsg3857/best/VIIRS_SNPP_DayNightBand_AtSensor_M15/default/2026-11-15/GoogleMapsCompatible_Level8/6/20/35.jpeg'
+    );
+
+    calls = [];
+    const badDate = await viirs.onRequestGet({
+      request: new Request('https://mirror.example.com/tiles/viirs/bad-date/6/20/35.jpeg'),
+      params: { date: 'bad-date', z: '6', y: '20', x: '35.jpeg' },
+    });
+    assert.equal(badDate.status, 400);
+    assert.equal(calls.length, 0);
+
+    const badZoom = await viirs.onRequestGet({
+      request: new Request('https://mirror.example.com/tiles/viirs/2026-11-15/9/0/0.jpeg'),
+      params: { date: '2026-11-15', z: '9', y: '0', x: '0.jpeg' },
+    });
+    assert.equal(badZoom.status, 400);
+    assert.equal(calls.length, 0);
+  });
+
+  it('constructs ArcGIS metadata URL and tile catch-all URL', async () => {
+    const metaRes = await arcgisMeta.onRequestGet({
+      request: new Request('https://mirror.example.com/arcgis?f=json'),
+      params: {},
+    });
+    assert.equal(metaRes.status, 200);
+    assert.equal(
+      calls[0].url,
+      'https://elevation3d.arcgis.com/arcgis/rest/services/WorldElevation3D/Terrain3D/ImageServer?f=json'
+    );
+    assert.equal(metaRes.headers.get('Cache-Control'), 'public, s-maxage=86400, max-age=3600');
+
+    calls = [];
+    const tileRes = await arcgisTile.onRequestGet({
+      request: new Request('https://mirror.example.com/arcgis/tile/5/10/15'),
+      params: { tile: 'tile/5/10/15' },
+    });
+    assert.equal(tileRes.status, 200);
+    assert.equal(
+      calls[0].url,
+      'https://elevation3d.arcgis.com/arcgis/rest/services/WorldElevation3D/Terrain3D/ImageServer/tile/5/10/15'
+    );
+
+    calls = [];
+    const badArcgisPath = await arcgisTile.onRequestGet({
+      request: new Request('https://mirror.example.com/arcgis/other/1/2/3'),
+      params: { tile: ['other', '1', '2', '3'] },
+    });
+    assert.equal(badArcgisPath.status, 400);
+    assert.equal(calls.length, 0);
+  });
+
+  it('constructs USGS earthquakes and models.dev URLs with appropriate TTLs', async () => {
+    const eqRes = await earthquakes.onRequestGet({
+      request: new Request('https://mirror.example.com/datasets/earthquakes'),
+    });
+    assert.equal(eqRes.status, 200);
+    assert.equal(
+      calls[0].url,
+      'https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/4.5_month.geojson'
+    );
+    assert.equal(eqRes.headers.get('Cache-Control'), 'public, s-maxage=600, max-age=300');
+
+    calls = [];
+    const mdRes = await modelsdev.onRequestGet({
+      request: new Request('https://mirror.example.com/modelsdev'),
+    });
+    assert.equal(mdRes.status, 200);
+    assert.equal(calls[0].url, 'https://models.dev/api.json');
+    assert.equal(mdRes.headers.get('Cache-Control'), 'public, s-maxage=21600, max-age=3600');
+  });
+
+  it('compresses large /modelsdev payloads using br or gzip when Accept-Encoding allows', async () => {
+    const bigJson = JSON.stringify({ data: 'x'.repeat(300 * 1024) });
+    globalThis.fetch = async () =>
+      new Response(bigJson, {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+
+    const brRes = await modelsdev.onRequestGet({
+      request: new Request('https://mirror.example.com/modelsdev', {
+        headers: { 'Accept-Encoding': 'gzip, deflate, br' },
+      }),
+    });
+    assert.equal(brRes.status, 200);
+    assert.equal(brRes.headers.get('Content-Encoding'), 'br');
+    assert.equal(brRes.headers.get('Vary'), 'Accept-Encoding');
+    const brBytes = Buffer.from(await brRes.arrayBuffer());
+    assert.ok(brBytes.byteLength < 100 * 1024);
+    assert.equal(brotliDecompressSync(brBytes).toString('utf8'), bigJson);
+
+    const gzRes = await modelsdev.onRequestGet({
+      request: new Request('https://mirror.example.com/modelsdev', {
+        headers: { 'Accept-Encoding': 'gzip' },
+      }),
+    });
+    assert.equal(gzRes.status, 200);
+    assert.equal(gzRes.headers.get('Content-Encoding'), 'gzip');
+    const gzBytes = Buffer.from(await gzRes.arrayBuffer());
+    assert.ok(gzBytes.byteLength < 100 * 1024);
+    assert.equal(gunzipSync(gzBytes).toString('utf8'), bigJson);
+  });
+
+  it('serves /health and / manifest locally with no-store', async () => {
+    const hRes = await health.onRequestGet();
+    assert.equal(hRes.status, 200);
+    assert.equal(hRes.headers.get('Cache-Control'), 'no-store');
+    assert.deepEqual(await hRes.json(), { ok: true, service: 'edge-proxy-cloudflare' });
+
+    const rRes = await manifest.onRequestGet();
+    assert.equal(rRes.status, 200);
+    assert.equal(rRes.headers.get('Cache-Control'), 'no-store');
+    const manifestBody = await rRes.json();
+    assert.equal(manifestBody.service, 'edge-proxy-cloudflare');
+    assert.equal(Array.isArray(manifestBody.routes), true);
+    assert.equal(calls.length, 0);
+  });
+});
